@@ -87,6 +87,10 @@ one later with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux `./se
 For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](docs/ORCA.md).
 It needs an explicit packing conversion and is not an installer menu option.
 
+**Another model?** Strata runs the Flash-Next layout (`qwen4exp`) only - fine-tunes and uncensored releases of it work,
+other architectures (a dense 27B, another MoE) do not. `python tools/model_check.py <owner/repo or file.gguf>` tells you
+which side a GGUF is on from its header alone, without downloading it: [Other models](docs/OTHER_MODELS.md).
+
 **Unsloth's 4-bit UD-Q4_K_XL** (experimental) is the fourth version in setup's menu (`--family unsloth`): the closest
 to the full model, but a 111 GB download whose 77 GB of experts do not fit in RAM. Strata keeps your RAM minus 24 GB
 of them in RAM and reads the rest from the SSD while it answers: 7-8.5 tokens/s on a 64 GB PC with a 12 GB GPU, several

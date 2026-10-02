@@ -31,11 +31,13 @@ def _s(x: str) -> bytes:
 
 
 def gguf(kv: dict, tensors: list) -> bytes:
-    """A GGUF v3 header: kv = {key: str | int (u32) | [int] (i32 array)}, tensors = [(name, shape, type name)]; no tensor data."""
+    """A GGUF v3 header: kv = {key: str | int (u32) | [int] (i32 array) | [bool]}, tensors = [(name, shape, type name)]; no tensor data."""
     b = bytearray(struct.pack("<IIQQ", G.GGUF_MAGIC, 3, len(tensors), len(kv)))
     for k, v in kv.items():
         if isinstance(v, str):
             b += _s(k) + struct.pack("<I", 8) + _s(v)
+        elif isinstance(v, list) and all(isinstance(x, bool) for x in v):    # an array of bool
+            b += _s(k) + struct.pack("<IIQ", 9, 7, len(v)) + struct.pack(f"<{len(v)}?", *v)
         elif isinstance(v, list):                                   # an array of i32
             b += _s(k) + struct.pack("<IIQ", 9, 5, len(v)) + struct.pack(f"<{len(v)}i", *v)
         else:
@@ -136,6 +138,9 @@ class Verdicts(unittest.TestCase):
         r = self.check(flash_next(gu="Q6_K"))
         self.assertEqual(r.status, "no")
         self.assertIn("not a type", r.problems[0])
+        self.assertTrue(any("take another file of the same model" in line for line in r.next))     # a way forward
+        wrong = self.check(gguf(meta(embedding_length=2048), model_tensors() + layer_tensors(range(LAYERS), gu="Q6_K")))
+        self.assertEqual(wrong.next, [])                        # a geometry problem is not cured by another quantization
 
     def test_gate_and_up_must_agree(self):
         t = layer_tensors(range(LAYERS))
@@ -175,6 +180,17 @@ class Verdicts(unittest.TestCase):
         self.assertEqual((r.status, r.shards_read), ("check", 1))      # the others' tensors are not judged
         self.assertTrue(any("shards not found" in w for w in r.warnings))
 
+    def test_a_corrupt_header_is_an_error_and_the_other_files_are_still_judged(self):
+        huge = struct.pack("<IIQQ", G.GGUF_MAGIC, 3, 0, 1) + struct.pack("<Q", 2**64 - 1)    # a key 2**64-1 bytes long
+        (self.dir / "bad.gguf").write_bytes(huge)
+        (self.dir / "good.gguf").write_bytes(flash_next())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = M.main([str(self.dir / "bad.gguf"), str(self.dir / "good.gguf"), "--json"])
+        reports = json.loads(out.getvalue())
+        self.assertEqual((code, [r["status"] for r in reports]), (2, ["error", "ok"]))
+        self.assertIn("corrupt header", reports[0]["problems"][0])
+
     def test_a_missing_file_and_a_non_gguf(self):
         with self.assertRaises(FileNotFoundError):
             M.read_model("x", str(self.dir / "nope.gguf"), M.Source(None, "https://huggingface.co", 5))
@@ -201,6 +217,9 @@ class Targets(unittest.TestCase):
         src = M.Source("secret", "https://huggingface.co", 5)
         self.assertEqual(src._headers("https://huggingface.co/api/models/a/b"), {"Authorization": "Bearer secret"})
         self.assertEqual(src._headers("https://nothf.co/x"), {})
+        self.assertEqual(src._headers("http://huggingface.co/x"), {})          # never in clear text
+        local = M.Source("secret", "http://127.0.0.1:9", 5)                     # an endpoint the user chose, as the tests do
+        self.assertEqual(local._headers("http://127.0.0.1:9/api"), {"Authorization": "Bearer secret"})
 
     def test_shard_names(self):
         self.assertEqual(M.shard_names("m-00002-of-00003.gguf"),
@@ -344,6 +363,21 @@ class Remote(unittest.TestCase):
         self.assertEqual([(t.name, t.shape, t.type_name) for t in remote.tensors],
                          [(t.name, t.shape, t.type_name) for t in local.tensors])
         self.assertGreater(len([1 for who, _, h in self.hub.seen if who == "cdn"]), 2)
+
+    def test_a_server_that_does_not_speak_http_is_an_error_not_a_traceback(self):
+        import socketserver
+
+        class Garbage(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.recv(1024)
+                self.request.sendall(b"this is not http\r\n\r\n")
+
+        srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Garbage)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        code, out, _ = self._cli(f"http://127.0.0.1:{srv.server_address[1]}/a/m.gguf")
+        self.assertEqual(code, 2)
+        self.assertIn("did not answer like an HTTP server", out)
 
     def test_a_server_that_ignores_range_is_refused(self):
         self.hub.ignore_range = True

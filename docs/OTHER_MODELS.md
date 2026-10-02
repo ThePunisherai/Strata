@@ -8,9 +8,12 @@ busiest ones on the GPU, and every kernel (GPU and CPU) is written for those dim
 
 So the question for any model file is: **is it a `qwen4exp` file?**
 
-- **Yes** - a fine-tune, an abliteration or an "uncensored" release of Flash-Next keeps the layout. It runs, as
-  Swift 1.5 and OrcaRouter's Uncensored already do. Setup lists only the families it was built for (qwen, swift,
-  coder, unsloth); any other such file is packed by hand with `tools/iq_pack.py` ([docs/ORCA.md](ORCA.md)).
+- **Yes** - a fine-tune, an abliteration or an "uncensored" release of Flash-Next keeps the layout, so it runs - in
+  a quantization whose expert types the engine reads (the IQ1_M-IQ3_S and Q2_0 files; Q4_K with Q5_1 / Q8_0 down
+  matrices is experimental; Q5_0 down matrices are refused). Swift 1.5 and OrcaRouter's Uncensored already do.
+  Setup lists only the families it was built for (qwen, swift, coder, unsloth); any other such file is packed by hand
+  with `tools/iq_pack.py` ([docs/ORCA.md](ORCA.md)). A file of this layout in a quantization the engine does not
+  read gets a NO that says so: take another file of the same model.
 - **No** - a dense 3B or 27B model, another MoE (Qwen3-30B-A3B style, GLM, Kimi, DeepSeek style) or any other
   architecture. Making one of them run is a new model implementation inside the engine - a loader plus the
   attention, router and expert kernels of that architecture - not a setting, a conversion or a new download.
@@ -65,7 +68,7 @@ python tools/llama_plan.py /models/Model-Q4_K_M.gguf --ctx 65536 --kv q8_0 --ram
 ```
   on the GPU   48 of 48 layers + output; experts of the last 29 layers (~14.3 GiB)
   in RAM       the rest (~7.1 GiB)
-  flags        -c 32768 -ngl 999 --n-cpu-moe 19 --jinja --host 127.0.0.1 --port 8080
+  flags        -c 32768 -ngl 999 --n-cpu-moe 19 -np 1 --jinja --host 127.0.0.1 --port 8080
 ```
 
 (An example from a synthetic 30B-class MoE header on 16 GiB of VRAM and 32 GiB of RAM; every number is arithmetic on
@@ -78,10 +81,19 @@ the header, not a measurement.)
   not, and the rest is read from the SSD (mmap) while it answers. `--run` refuses a SLOW plan without `--force`, a port
   that is in use, and a repo target (download the file first).
 - **KV cache.** From the attention keys of the header: K and V for `--ctx` tokens at `--kv` (f16, q8_0, q4_0). A hybrid
-  model with a per-layer table or `full_attention_interval` counts its attention layers only; a recurrent model
-  without one is an upper bound, and a header that does not say gets `--kv-gib`.
-- **Builds.** `--run` reads `llama-server --help`: `--n-cpu-moe` or the `-ot` pattern, and flash attention (needed by a
-  quantized cache) in the spelling that build uses. Without `--run` both spellings are printed.
+  model with a per-layer table or `full_attention_interval` counts its attention layers only. A sliding-window model
+  (Gemma, gpt-oss) whose header has a layer pattern counts the window layers at the window plus one micro-batch
+  (llama.cpp's default cache; `--swa-full` would size them at the full context); without a pattern, a recurrent model
+  without a table, and latent attention it is an upper bound, and says so. A header that does not say gets `--kv-gib`.
+- **Slots.** The plan passes `-np 1`: one request at a time, like Strata, and `--ctx` is the whole context of that
+  slot. `--parallel N` splits `--ctx` over N slots.
+- **Tied embeddings** (no `output.weight`): one copy in RAM, and a second on the GPU when the output layer is there.
+- **Builds.** `--run` reads `llama-server --help` and spells the expert flag (`--n-cpu-moe` or the `-ot` pattern) and
+  flash attention (needed by a quantized cache) the way that build does. Without `--run` both spellings of the expert
+  flag are printed, and a quantized cache gets a note naming `-fa on` / `-fa`.
+- **`--run`** starts the named llama-server (`--llama-server`, else `$LLAMA_SERVER`, else PATH - a named path that is
+  not an executable is an error, never another binary), with the first shard under its own path, and stops it again on
+  Ctrl-C, SIGTERM or SIGHUP.
 - **`--ram-bw`** (GB/s) adds a roofline: the decode speed if the CPU's only job were reading the active experts. The
   real speed is lower, but it ranks models and quantizations against each other.
 

@@ -87,8 +87,8 @@ one later with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux `./se
 For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](docs/ORCA.md).
 It needs an explicit packing conversion and is not an installer menu option.
 
-**Another model?** Strata runs the Flash-Next layout (`qwen4exp`) only - fine-tunes and uncensored releases of it work,
-other architectures (a dense 27B, another MoE) do not. `python tools/model_check.py <owner/repo or file.gguf>` tells you
+**Another model?** Strata runs the Flash-Next layout (`qwen4exp`) only - fine-tunes and uncensored releases of it work (in the
+quantizations its kernels read), other architectures (a dense 27B, another MoE) do not. `python tools/model_check.py <owner/repo or file.gguf>` tells you
 which side a GGUF is on from its header alone, without downloading it, and `tools/llama_plan.py` plans llama.cpp's expert
 offload for the ones that are not (VRAM / RAM / context arithmetic, `--run` starts it on the same address):
 [Other models](docs/OTHER_MODELS.md).

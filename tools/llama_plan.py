@@ -30,11 +30,10 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
 import socket
-import struct
 import subprocess
 import sys
-import urllib.error
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -49,6 +48,8 @@ BLOCK = re.compile(r"^blk\.(\d+)\.")
 OUTPUT = ("output.weight", "output_norm.weight", "output_norm.bias")    # llama.cpp offloads these with the last layer
 EMBED = "token_embd.weight"                                             # the input embedding stays in RAM
 ALL_LAYERS = 999                                                        # -ngl: more than any model has layers
+SWA_UBATCH = 512                                                        # llama-server's -ub: a window cache holds the window + one micro-batch
+SWA_PAD = 256                                                           # llama.cpp pads a KV cache to this many cells
 DEFAULT_CTX = 32768
 SERVER_NAMES = ("llama-server", "llama-server.exe")
 
@@ -126,8 +127,18 @@ def _scalar(v):
     return max(v) if isinstance(v, list) else v
 
 
-def kv_layers(meta: dict, arch: str, n_layers: int, ctx: int, kv: str):
-    """(bytes of KV cache per layer, a note or None): K and V for `ctx` tokens at the cache type's width."""
+def swa_flags(meta: dict, arch: str, n_layers: int):
+    """Which layers use sliding-window attention: a list of bool, or None when the header does not say."""
+    pat = meta.get(f"{arch}.attention.sliding_window_pattern")
+    if isinstance(pat, list) and len(pat) == n_layers:
+        return [bool(x) for x in pat]                       # a per-layer table: true = a sliding-window layer
+    if isinstance(pat, int) and not isinstance(pat, bool) and pat >= 1:
+        return [i % pat < pat - 1 for i in range(n_layers)]     # every pat-th layer is global (llama.cpp's default order)
+    return None
+
+
+def kv_layers(meta: dict, arch: str, n_layers: int, ctx: int, kv: str, parallel: int = 1):
+    """(bytes of KV cache per layer, notes): K and V for `ctx` tokens at the cache type's width."""
     heads, kv_heads = _meta(meta, arch, "attention.head_count"), _meta(meta, arch, "attention.head_count_kv")
     width = _meta(meta, arch, "embedding_length")
     if kv_heads is None:
@@ -141,7 +152,7 @@ def kv_layers(meta: dict, arch: str, n_layers: int, ctx: int, kv: str):
             raise ValueError(f"no {arch}.attention.key_length and no head count to derive it: pass --kv-gib")
         key_len = width // h
     val_len = _scalar(_meta(meta, arch, "attention.value_length")) or key_len
-    note = None
+    notes = []
     if isinstance(kv_heads, list):
         if len(kv_heads) != n_layers:
             raise ValueError(f"{arch}.attention.head_count_kv has {len(kv_heads)} entries for {n_layers} layers")
@@ -152,9 +163,24 @@ def kv_layers(meta: dict, arch: str, n_layers: int, ctx: int, kv: str):
         if isinstance(interval, int) and interval > 1:      # a hybrid: only every interval-th layer caches K/V
             per_layer = [kv_heads if (i + 1) % interval == 0 else 0 for i in range(n_layers)]
         elif any(k.startswith(f"{arch}.ssm.") for k in meta):
-            note = "recurrent layers found without a per-layer table: the KV cache is counted for every layer (an upper bound)"
-    elems = [h * (key_len + val_len) * ctx for h in per_layer]
-    return [e * KV_BYTES[kv] for e in elems], note
+            notes.append("recurrent layers found without a per-layer table: the KV cache is counted for every layer (an upper bound)")
+    tokens = [ctx] * n_layers
+    window = _scalar(_meta(meta, arch, "attention.sliding_window"))
+    if window:
+        flags = swa_flags(meta, arch, n_layers)
+        if flags is None:
+            notes.append("sliding-window attention without a layer pattern in the header: the KV cache is counted at the full "
+                         "context on every layer (an upper bound - llama.cpp keeps only the window on those layers); "
+                         "--kv-gib plans with the real size")
+        else:
+            swa = min(ctx, -(-(window * parallel + SWA_UBATCH) // SWA_PAD) * SWA_PAD)
+            tokens = [swa if f else ctx for f in flags]
+            notes.append(f"sliding-window layers ({sum(flags)} of {n_layers}) are counted at {swa} tokens: llama.cpp's default "
+                         "window cache (--swa-full would size them at the full context)")
+    if any(k.startswith(f"{arch}.attention.kv_lora_rank") for k in meta):
+        notes.append("multi-head latent attention: recent llama.cpp builds cache a compressed latent, smaller than counted "
+                     "here (an upper bound)")
+    return [h * (key_len + val_len) * t * KV_BYTES[kv] for h, t in zip(per_layer, tokens)], notes
 
 
 def fit_from_end(costs: list, budget: float) -> int:
@@ -216,8 +242,9 @@ def plan_model(label: str, files: list, declared: int, absent: list, hw: dict, o
             experts[int(m[1])] += size
         else:
             dense[int(m[1])] += size
-    if EMBED in tensors and "output.weight" not in tensors:
-        outputs += embed                                    # tied embeddings: the output layer needs them on the GPU
+    # tied embeddings (no output.weight): the output layer reads token_embd. On the GPU that is a second copy; on the CPU
+    # llama.cpp points it at the same mmap pages, so only the GPU is charged for it
+    tied = embed if EMBED in tensors and "output.weight" not in tensors else 0
     n_expert, used = _meta(meta, arch, "expert_count") or 0, _meta(meta, arch, "expert_used_count") or 0
     is_moe = sum(experts) > 0
 
@@ -225,9 +252,8 @@ def plan_model(label: str, files: list, declared: int, absent: list, hw: dict, o
         if o.kv_gib is not None:
             kv = [o.kv_gib * GIB / n_layers] * n_layers
         else:
-            kv, note = kv_layers(meta, arch, n_layers, o.ctx, o.kv)
-            if note:
-                plan.notes.append(note)
+            kv, notes = kv_layers(meta, arch, n_layers, o.ctx, o.kv, o.parallel)
+            plan.notes += notes
     except ValueError as e:
         plan.problems.append(str(e))
         return plan
@@ -236,10 +262,10 @@ def plan_model(label: str, files: list, declared: int, absent: list, hw: dict, o
     vram, ram = hw["vram"] * GIB, hw["ram"] * GIB
     budget = vram - o.reserve_vram * GIB
     costs = [dense[i] + kv[i] for i in range(n_layers)]
-    on_gpu = fit_from_end(costs, budget - outputs)
+    on_gpu = fit_from_end(costs, budget - outputs - tied)
     if on_gpu == n_layers:
         ngl, out_on_gpu = ALL_LAYERS, True
-        leftover = budget - outputs - sum(costs)
+        leftover = budget - outputs - tied - sum(costs)
     else:
         on_gpu = fit_from_end(costs, budget)                # the output layer stays on the CPU, and no expert is left room
         ngl, out_on_gpu, leftover = on_gpu, False, 0
@@ -251,11 +277,12 @@ def plan_model(label: str, files: list, declared: int, absent: list, hw: dict, o
             leftover -= experts[i]
             exp_on_gpu += 1
     gpu_layers, gpu_exp = range(n_layers - on_gpu, n_layers), range(n_layers - exp_on_gpu, n_layers)
-    gpu_bytes = (outputs if out_on_gpu else 0) + sum(costs[i] for i in gpu_layers) + sum(experts[i] for i in gpu_exp)
+    gpu_bytes = (outputs + tied if out_on_gpu else 0) + sum(costs[i] for i in gpu_layers) + sum(experts[i] for i in gpu_exp)
     cpu_dense = sum(dense[i] for i in range(n_layers) if i not in gpu_layers)
     cpu_kv = sum(kv[i] for i in range(n_layers) if i not in gpu_layers)
     cpu_exp = sum(experts[i] for i in range(n_layers) if i not in gpu_exp)
     cpu_bytes = embed + other + (0 if out_on_gpu else outputs) + cpu_dense + cpu_kv + cpu_exp
+    weights = sum(dense) + sum(experts) + outputs + embed + other
 
     plan.ngl = ngl
     plan.n_cpu_moe = (n_layers - exp_on_gpu) if is_moe else None
@@ -266,14 +293,15 @@ def plan_model(label: str, files: list, declared: int, absent: list, hw: dict, o
     else:
         plan.flags_ot = list(plan.flags)
     tail = (["-ctk", o.kv, "-ctv", o.kv] if o.kv != "f16" else []) + (["-t", str(o.threads)] if o.threads else []) + \
-        ["--jinja", "--host", o.host, "--port", str(o.port)] + (["--alias", o.alias] if o.alias else [])
+        ["-np", str(o.parallel), "--jinja", "--host", o.host, "--port", str(o.port)] + \
+        (["--alias", o.alias] if o.alias else [])
     plan.flags += tail
     plan.flags_ot += tail
 
     plan.facts = {
         "layers": n_layers, "experts": n_expert or None, "experts_used": used or None, "moe": is_moe,
-        "weights_gib": round((sum(dense) + sum(experts) + outputs + embed + other) / GIB, 1),
-        "dense_gib": round((sum(dense) + outputs) / GIB, 1), "experts_gib": round(sum(experts) / GIB, 1),
+        "weights_gib": round(weights / GIB, 1), "dense_gib": round((weights - sum(experts)) / GIB, 1),
+        "experts_gib": round(sum(experts) / GIB, 1),
         "kv_gib": round(sum(kv) / GIB, 1), "layers_on_gpu": on_gpu, "output_on_gpu": out_on_gpu,
         "expert_layers_on_gpu": exp_on_gpu if is_moe else None,
         "gpu_gib": round(gpu_bytes / GIB, 1), "cpu_gib": round(cpu_bytes / GIB, 1),
@@ -294,7 +322,10 @@ def plan_model(label: str, files: list, declared: int, absent: list, hw: dict, o
     if on_gpu < n_layers:
         plan.notes.append(f"the dense layers do not all fit {hw['vram']:.1f} GiB of VRAM: {n_layers - on_gpu} of {n_layers} "
                           "run on the CPU (slow); lower --ctx, use --kv q8_0, or a smaller quantization")
-    if is_moe and o.kv == "f16" and plan.n_cpu_moe:
+    if o.kv != "f16":
+        plan.notes.append("a quantized V cache needs flash attention: add `-fa on` (current llama.cpp) or `-fa` (older builds) "
+                          "to the flags; --run adds the right one for the build it finds")
+    elif is_moe and plan.n_cpu_moe:
         plan.notes.append("--kv q8_0 halves the KV cache (more experts on the GPU); it needs llama.cpp's flash attention")
 
     # a roofline: the bytes the CPU reads per token, against the RAM bandwidth the user gave
@@ -309,10 +340,17 @@ def plan_model(label: str, files: list, declared: int, absent: list, hw: dict, o
 
 # ------------------------------------------------------------------------------------------------ llama-server
 def find_server(explicit: str | None) -> str:
-    cands = [explicit, os.environ.get("LLAMA_SERVER")] + [shutil.which(n) for n in SERVER_NAMES]
-    for c in cands:
-        if c and os.path.isfile(c):
-            return c
+    """The llama-server to run: --llama-server, else $LLAMA_SERVER, else PATH. A path the user named is never replaced
+    by another binary: if it is not an executable file, that is the error."""
+    named = explicit or os.environ.get("LLAMA_SERVER")
+    if named:
+        found = named if os.path.isfile(named) and os.access(named, os.X_OK) else shutil.which(named)
+        if not found:
+            raise FileNotFoundError(f"{named}: not an executable file (from {'--llama-server' if explicit else '$LLAMA_SERVER'})")
+        return found
+    for n in SERVER_NAMES:
+        if shutil.which(n):
+            return shutil.which(n)
     raise FileNotFoundError("llama-server not found: build or download llama.cpp, then pass --llama-server <path> "
                             "(or set LLAMA_SERVER, or put it on PATH)")
 
@@ -347,17 +385,39 @@ def port_in_use(host: str, port: int) -> bool:
 
 
 def run_server(cmd: list) -> int:
+    """Runs llama-server until it exits. Ctrl-C, SIGTERM and SIGHUP (a service manager's stop, a closed terminal) stop it
+    too: the child is terminated, then killed after 15 s, never left running without its parent."""
     log.info("starting: %s", join(cmd))
-    proc = subprocess.Popen(cmd)
+    try:
+        proc = subprocess.Popen(cmd)
+    except OSError as e:
+        print(f"\nnot starting: {cmd[0]}: {e.strerror or e}", file=sys.stderr)
+        return 2
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    old = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            try:
+                old[getattr(signal, name)] = signal.signal(getattr(signal, name), stop)
+            except ValueError:                              # not the main thread: the caller's handlers stay
+                pass
     try:
         return proc.wait()
     except KeyboardInterrupt:
-        proc.terminate()
-        try:
-            return proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            return proc.wait()
+        return 130
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
 
 
 def join(cmd: list) -> str:
@@ -418,6 +478,8 @@ def main(argv=None) -> int:
     ap.add_argument("--reserve-ram", type=float, default=8.0, help="GiB of RAM left to the system and other programs (8)")
     ap.add_argument("--ram-bw", type=float, help="RAM bandwidth in GB/s: adds a decode-speed ceiling to the plan")
     ap.add_argument("--threads", type=int, help="llama-server -t (default: its own choice)")
+    ap.add_argument("--parallel", type=int, default=1, help="slots, llama-server -np (default 1: one request at a time, "
+                                                            "like Strata; --ctx is shared between them)")
     ap.add_argument("--host", default="127.0.0.1", help="address to serve on (default 127.0.0.1, like Strata)")
     ap.add_argument("--port", type=int, default=8080, help="port (default 8080, like Strata)")
     ap.add_argument("--alias", help="the model name clients see")
@@ -427,7 +489,7 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true", help="--run even when the plan is SLOW")
     a = ap.parse_args(argv)
     src = M.source_from(a, ap)
-    for name in ("ctx", "port"):
+    for name in ("ctx", "port", "parallel"):
         if getattr(a, name) < 1:
             ap.error(f"--{name} must be positive")
     for name in ("vram", "ram", "kv_gib", "ram_bw"):
@@ -436,6 +498,8 @@ def main(argv=None) -> int:
             ap.error(f"--{name.replace('_', '-')} must be positive")
     if a.reserve_vram < 0 or a.reserve_ram < 0 or (a.threads is not None and a.threads < 1):
         ap.error("--reserve-vram / --reserve-ram cannot be negative, --threads must be positive")
+    if a.run and (len(a.targets) != 1 or not os.path.isfile(a.targets[0])):
+        ap.error("--run needs exactly one target, a local .gguf file (download it first)")
     hw = {"vram": a.vram if a.vram is not None else detect_vram_gib(),
           "ram": a.ram if a.ram is not None else detect_ram_gib()}
     for key in ("vram", "ram"):
@@ -450,12 +514,15 @@ def main(argv=None) -> int:
                 try:
                     files, names, absent = M.read_headers(first, src)
                     plan = plan_model(label, files, len(names), absent, hw, a)
-                    plan.model_path = None if first.startswith(("http://", "https://")) else str(pathlib.Path(first).resolve())
+                    if not first.startswith(("http://", "https://")):
+                        # -m is the first shard under the name it was given (llama.cpp finds the others beside it by name):
+                        # absolute, but a symlink - the Hugging Face cache's - is not followed to its hash-named blob
+                        plan.model_path = os.path.abspath(os.path.join(os.path.dirname(first), names[0]))
                     plans.append(plan)
-                except (OSError, struct.error, KeyError, ValueError, UnicodeError, MemoryError) as e:
+                except M.READ_ERRORS as e:
                     log.debug("%s", label, exc_info=True)
                     plans.append(Plan(target=label, status="error", problems=[M.why(e)]))
-        except (OSError, ValueError, json.JSONDecodeError) as e:
+        except M.READ_ERRORS as e:
             log.debug("%s", arg, exc_info=True)
             plans.append(Plan(target=arg, status="error", problems=[M.why(e)]))
     if a.json:
@@ -469,8 +536,6 @@ def main(argv=None) -> int:
                 print(f"  {p.status.upper():<6} {p.target}")
 
     if a.run:
-        if len(plans) != 1 or plans[0].model_path is None:
-            ap.error("--run needs exactly one target, a local .gguf file (download it first)")
         p = plans[0]
         if p.status in ("no", "error") or (p.status == "slow" and not a.force):
             print(f"\nnot starting: the plan is {p.status.upper()}" + (" (--force starts it anyway)" if p.status == "slow" else ""),

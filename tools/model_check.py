@@ -14,7 +14,8 @@ header alone (a local file, or a URL / Hugging Face repo through HTTP Range requ
 
 A split model ("-00001-of-0000N.gguf") is read shard by shard: the first shard has the metadata, the layers are
 spread over all of them.  Verdicts: ok = the engine's own checks pass and every expert type is one it reads;
-check = it should run, with a condition named below (an experimental route, a rounding step); no = it will not.
+check = it should run, with a condition named in the report (an experimental K-quant route, an unusual expert count,
+shards that were not found); no = it will not.  An ok may still say what packing needs (a BF16 rounding step).
 
 Exit status: 0 every file ok/check, 1 at least one `no`, 2 a file could not be read.  `--json` prints the reports;
 -v / -vv log what is read to stderr.  HF_TOKEN reaches a gated repo (sent to the Hub only, never to a redirect).
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import http.client
 import json
 import logging
 import os
@@ -61,6 +63,11 @@ LAYER_TENSORS = tuple(f"ffn_{r}_exps.weight" for r in ROLES) + ("ffn_gate_inp.we
 
 SPLIT = re.compile(r"^(?P<stem>.*)-(?P<no>\d{5})-of-(?P<n>\d{5})\.gguf$")
 HF_HOSTS = ("huggingface.co", "hf.co")
+# What reading a header can raise for a corrupt or hostile file or a misbehaving server: reported per file, so one bad
+# file does not take the other results with it (the parser trusts the lengths a header gives; OverflowError and
+# MemoryError are what a 2**63-byte string or array count turns into).
+READ_ERRORS = (OSError, ValueError, KeyError, UnicodeError, ArithmeticError, MemoryError, RecursionError, struct.error,
+               http.client.HTTPException)
 
 
 def is_hub(netloc: str) -> bool:
@@ -258,6 +265,7 @@ def analyse(target: str, files: list, declared: int) -> Report:
             break
     rep.facts["expert_types"] = {"gate_up": sorted(gu_types), "down": sorted(d_types)}
     rep.facts["experts_gib"] = round(expert_bytes / GIB, 1)
+    before_types = len(rep.problems)
     conditions: dict = {}
     for role, types, ok in (("gate/up", gu_types, GATE_UP), ("down", d_types, DOWN)):
         for ty in sorted(types):
@@ -270,11 +278,13 @@ def analyse(target: str, files: list, declared: int) -> Report:
                 conditions.setdefault(ok[ty], []).append(f"{role} {ty}")
     for text, which in conditions.items():
         rep.warnings.append(f"{', '.join(which)} - {text}")
+    only_types = before_types == 0 and bool(rep.problems) and all("experts are" in p for p in rep.problems)
     if not expert_bytes and complete and not rep.problems:
         rep.problems.append("no routed-expert tensors found")
 
     # 4. the small projections the engine reads as BF16: converted (rounded) by iq_pack --compat-bf16
     form, native_key = _bf16_wanted()
+    bf16_hint = None
     if form:
         stray = [n for n, t in tensors.items()
                  if form.get(re.sub(r"^blk\.\d+\.", "", n)) == "BF16" and t.type_name != "BF16"
@@ -282,12 +292,18 @@ def analyse(target: str, files: list, declared: int) -> Report:
         rep.facts["bf16_conversions"] = len(stray)
         if stray:
             kinds = sorted({tensors[n].type_name for n in stray})
-            rep.next.append(f"{len(stray)} small projections are stored as {'/'.join(kinds)} where the engine reads BF16: "
-                            "pack with --compat-bf16 (rounds them to BF16; the original precision is not restored)")
+            bf16_hint = (f"{len(stray)} small projections are stored as {'/'.join(kinds)} where the engine reads BF16: "
+                         "pack with --compat-bf16 (rounds them to BF16; the original precision is not restored)")
 
     # 5. the verdict and the route
     rep.status = "no" if rep.problems else "check" if rep.warnings else "ok"
+    if rep.status == "no" and only_types:
+        rep.next.append("the layout is Flash-Next's, only this quantization's expert types are not read: take another file "
+                        "of the same model (IQ1_M-IQ3_S or Q2_0 experts, or Q4_K with Q5_1 / Q8_0 down - docs/UNSLOTH_Q4.md); "
+                        "model_check <owner/repo> lists them")
     if rep.status != "no":
+        if bf16_hint:
+            rep.next.append(bf16_hint)
         stem = SPLIT.sub(r"\g<stem>", files[0].path.name) if SPLIT.match(files[0].path.name) \
             else re.sub(r"\.gguf$", "", files[0].path.name)
         rep.next += [
@@ -310,8 +326,8 @@ class Source:
         self.opener = urllib.request.build_opener(_KeepAuthOnHost)
 
     def _headers(self, url: str) -> dict:
-        host = urllib.parse.urlparse(url).netloc
-        ours = host == urllib.parse.urlparse(self.endpoint).netloc or is_hub(host)
+        u, e = urllib.parse.urlparse(url), urllib.parse.urlparse(self.endpoint)
+        ours = (u.scheme, u.netloc) == (e.scheme, e.netloc) or (is_hub(u.netloc) and u.scheme == "https")   # no clear text to the Hub
         return {"Authorization": f"Bearer {self.token}"} if self.token and ours else {}
 
     def open_url(self, url: str) -> RemoteGGUF:
@@ -410,10 +426,10 @@ def run_target(arg: str, a, src: Source) -> list:
         for label, first in resolve(arg, a, src):
             try:
                 reports.append(read_model(label, first, src))
-            except (OSError, struct.error, KeyError, ValueError, UnicodeError, MemoryError) as e:
+            except READ_ERRORS as e:
                 log.debug("%s", label, exc_info=True)
                 reports.append(Report(target=label, status="error", problems=[why(e)]))
-    except (OSError, ValueError, json.JSONDecodeError) as e:
+    except READ_ERRORS as e:
         log.debug("%s", arg, exc_info=True)
         reports.append(Report(target=arg, status="error", problems=[why(e)]))
     return reports
@@ -426,6 +442,10 @@ def why(e: Exception) -> str:
         return f"HTTP {e.code} from {urllib.parse.urlparse(e.url).netloc}{hint}"
     if isinstance(e, urllib.error.URLError):
         return f"cannot reach the host: {e.reason}" + (" (a proxy or network policy blocks it)" if "403" in str(e.reason) else "")
+    if isinstance(e, http.client.HTTPException):
+        return f"the server did not answer like an HTTP server ({type(e).__name__})"
+    if isinstance(e, (ArithmeticError, MemoryError, RecursionError)):
+        return f"corrupt header: a length or count in it is out of range ({type(e).__name__})"
     return f"{type(e).__name__}: {e}" if not isinstance(e, FileNotFoundError) else str(e)
 
 

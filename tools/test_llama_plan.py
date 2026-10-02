@@ -12,6 +12,7 @@ import os
 import re
 import socket
 import stat
+import struct
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
+import gguf_reader as G  # noqa: E402
 import llama_plan as L  # noqa: E402
 import model_check as M  # noqa: E402
 import test_model_check as T  # noqa: E402
@@ -51,19 +53,19 @@ def layer(i: int, moe=True, gu="Q4_K", down="Q6_K") -> list:
     return t
 
 
-def ends() -> list:
-    return [("token_embd.weight", [EMB, VOCAB], "Q4_K"), ("output.weight", [EMB, VOCAB], "Q6_K"),
-            ("output_norm.weight", [EMB], "F32")]
+def ends(tied=False) -> list:
+    out = [] if tied else [("output.weight", [EMB, VOCAB], "Q6_K")]
+    return [("token_embd.weight", [EMB, VOCAB], "Q4_K"), *out, ("output_norm.weight", [EMB], "F32")]
 
 
-def model(moe=True, layers=LAYERS, meta=None, **kw) -> bytes:
-    return T.gguf(meta or moe_meta(), ends() + [x for i in range(layers) for x in layer(i, moe, **kw)])
+def model(moe=True, layers=LAYERS, meta=None, tied=False, **kw) -> bytes:
+    return T.gguf(meta or moe_meta(), ends(tied) + [x for i in range(layers) for x in layer(i, moe, **kw)])
 
 
 class Opts:
     """The command-line options plan_model reads."""
     ctx, kv, kv_gib, reserve_vram, reserve_ram, ram_bw = 32768, "f16", None, 1.5, 8.0, None
-    threads, host, port, alias = None, "127.0.0.1", 8080, None
+    threads, host, port, alias, parallel = None, "127.0.0.1", 8080, None, 1
 
     def __init__(self, **kw):
         self.__dict__.update(kw)
@@ -100,6 +102,7 @@ class Planning(unittest.TestCase):
         self.assertEqual(flag(p.flags, "--n-cpu-moe"), str(p.n_cpu_moe))
         self.assertEqual(flag(p.flags, "-ngl"), "999")
         self.assertIn("--jinja", p.flags)
+        self.assertEqual(flag(p.flags, "-np"), "1")                      # one request at a time, like Strata
         self.assertEqual((flag(p.flags, "--host"), flag(p.flags, "--port")), ("127.0.0.1", "8080"))   # Strata's address
         self.assertNotIn("--n-cpu-moe", p.flags_ot)
         self.assertEqual(flag(p.flags_ot, "-ot"), L.override_tensor(p.n_cpu_moe, LAYERS))
@@ -179,6 +182,54 @@ class Planning(unittest.TestCase):
         odd = self.plan(T.gguf(moe_meta(), ends() + layer(0) + [("blk.0.x.weight", [256], "TQ1_0")]))
         self.assertEqual(odd.status, "no")
         self.assertIn("TQ1_0", odd.problems[0])                         # a type whose size this tool does not know
+
+    def test_sliding_window_layers_cache_the_window_not_the_context(self):
+        full = self.plan(model()).facts["kv_gib"]
+        no_pattern = self.plan(model(meta=moe_meta(**{"attention.sliding_window": 1024})))
+        self.assertEqual(no_pattern.facts["kv_gib"], full)               # no layer table: an upper bound, and it says so
+        self.assertTrue(any("sliding-window attention without a layer pattern" in n for n in no_pattern.notes))
+        every_6th_global = self.plan(model(meta=moe_meta(**{"attention.sliding_window": 1024, "attention.sliding_window_pattern": 6})))
+        swa_layers = sum(1 for i in range(LAYERS) if i % 6 < 5)
+        window = 1536                                                    # 1024 + the 512-token micro-batch, already a multiple of 256
+        expect = (LAYERS - swa_layers) * 32768 + swa_layers * window
+        self.assertAlmostEqual(every_6th_global.facts["kv_gib"], full * expect / (LAYERS * 32768), delta=0.06)
+        self.assertTrue(any(f"({swa_layers} of {LAYERS})" in n and f"{window} tokens" in n for n in every_6th_global.notes))
+        flags = [i % 3 != 2 for i in range(LAYERS)]                      # a per-layer table, true = a sliding-window layer
+        table = self.plan(model(meta=moe_meta(**{"attention.sliding_window": 1024, "attention.sliding_window_pattern": flags})))
+        self.assertAlmostEqual(table.facts["kv_gib"], full * (flags.count(False) * 32768 + flags.count(True) * window)
+                               / (LAYERS * 32768), delta=0.06)
+        slots = self.plan(model(meta=moe_meta(**{"attention.sliding_window": 1024, "attention.sliding_window_pattern": 6})),
+                          parallel=4)
+        self.assertGreater(slots.facts["kv_gib"], every_6th_global.facts["kv_gib"])      # four windows per layer
+        self.assertEqual(flag(slots.flags, "-np"), "4")
+        small = self.plan(model(meta=moe_meta(**{"attention.sliding_window": 1024, "attention.sliding_window_pattern": 6})), ctx=512)
+        self.assertLess(small.facts["kv_gib"], 0.1)                      # the window never exceeds the context
+
+    def test_a_latent_attention_header_is_marked_an_upper_bound(self):
+        p = self.plan(model(meta=moe_meta(**{"attention.kv_lora_rank": 512})))
+        self.assertTrue(any("latent attention" in n for n in p.notes))
+
+    def test_tied_embeddings_are_one_copy_in_ram_and_one_more_on_the_gpu(self):
+        tied = model(tied=True)
+        sizes = {t.name: t.expected_bytes() for t in M.G.GGUFFile(self.dir / "tied.gguf").tensors} \
+            if (self.dir / "tied.gguf").write_bytes(tied) else {}
+        on_disk = sum(sizes.values()) / GIB
+        embed = sizes["token_embd.weight"] / GIB
+        p = self.plan(tied)                                              # fits: the output layer takes a GPU copy
+        self.assertAlmostEqual(p.facts["weights_gib"], on_disk, delta=0.06)       # the header's tensors, once
+        self.assertTrue(p.facts["output_on_gpu"])
+        self.assertAlmostEqual(p.facts["gpu_gib"] + p.facts["cpu_gib"], on_disk + p.facts["kv_gib"] + embed, delta=0.15)
+        small = self.plan(tied, vram=3.5, ram=64.0)                      # the output layer stays on the CPU: the same pages
+        self.assertFalse(small.facts["output_on_gpu"])
+        self.assertAlmostEqual(small.facts["gpu_gib"] + small.facts["cpu_gib"], on_disk + small.facts["kv_gib"], delta=0.15)
+        untied = self.plan(model())
+        self.assertAlmostEqual(untied.facts["gpu_gib"] + untied.facts["cpu_gib"],
+                               untied.facts["weights_gib"] + untied.facts["kv_gib"], delta=0.15)
+
+    def test_a_quantized_cache_says_it_needs_flash_attention(self):
+        q = self.plan(model(), kv="q8_0")
+        self.assertTrue(any("-fa on" in n and "-fa`" in n for n in q.notes))                  # both spellings
+        self.assertFalse(any("flash attention: add" in n for n in self.plan(model()).notes))
 
     def test_flash_next_is_pointed_at_strata(self):
         p = self.plan(T.flash_next())
@@ -267,7 +318,7 @@ class Cli(unittest.TestCase):
         code, out, _ = self.cli(str(self.dir / "m.gguf"), "--json", "--ctx", "8192", "--alias", "muse")
         plan = json.loads(out)[0]
         self.assertEqual((code, plan["status"], plan["facts"]["ctx"]), (0, "ok", 8192))
-        self.assertEqual(plan["model_path"], str((self.dir / "m.gguf").resolve()))
+        self.assertEqual(plan["model_path"], os.path.abspath(self.dir / "m.gguf"))
         self.assertEqual(flag(plan["flags"], "--alias"), "muse")
 
     def test_plan_text(self):
@@ -281,12 +332,17 @@ class Cli(unittest.TestCase):
                                 "--kv", "q8_0")
         self.assertEqual(code, 0, out)
         argv = json.loads(self.record.read_text())
-        self.assertEqual(argv[:2], ["-m", str((self.dir / "m.gguf").resolve())])
+        self.assertEqual(argv[:2], ["-m", os.path.abspath(self.dir / "m.gguf")])
         self.assertIn("--n-cpu-moe", argv)
         self.assertEqual(argv[-2:], ["-fa", "on"])
         self.assertIn("API: http://127.0.0.1:", out)
 
     def test_run_refuses(self):
+        (self.dir / "empty").mkdir()
+        with env(PATH=str(self.dir / "empty"), LLAMA_SERVER=None):         # a llama-server on the machine must not matter
+            self._run_refuses()
+
+    def _run_refuses(self):
         port = free_port()
         with socket.socket() as busy:                                     # something already listens: Strata, say
             busy.bind(("127.0.0.1", port))
@@ -297,9 +353,88 @@ class Cli(unittest.TestCase):
         self.assertFalse(self.record.exists())
         code, _, err = self.cli(str(self.dir / "m.gguf"), "--run", "--llama-server", str(self.dir / "nope"), "--port", str(free_port()))
         self.assertEqual(code, 2)
-        self.assertIn("llama-server not found", err)
-        code, _, _ = self.cli("owner/repo", "--run")
-        self.assertEqual(code, 2)                                         # --run needs one local file
+        self.assertIn("not an executable file", err)                      # the path that was named, not another binary
+        code, _, err = self.cli(str(self.dir / "m.gguf"), "--run", "--port", str(free_port()))
+        self.assertEqual(code, 2)
+        self.assertIn("llama-server not found", err)                      # nothing named, nothing on PATH
+        for argv in (["owner/repo", "--run"], [str(self.dir / "m.gguf"), str(self.dir / "m.gguf"), "--run"]):
+            code, _, err = self.cli(*argv, "--endpoint", "http://127.0.0.1:9")    # refused before anything is read or fetched
+            self.assertEqual(code, 2)
+            self.assertIn("--run needs exactly one target", err)
+
+    def test_a_huggingface_cache_layout_keeps_its_symlink_names(self):
+        blobs, snap = self.dir / "blobs", self.dir / "snapshots" / "abc"
+        blobs.mkdir()
+        snap.mkdir(parents=True)
+        half = LAYERS // 2
+        (blobs / "aa11").write_bytes(T.gguf(moe_meta(), ends() + [x for i in range(half) for x in layer(i)]))
+        (blobs / "bb22").write_bytes(T.gguf({"split.no": 1}, [x for i in range(half, LAYERS) for x in layer(i)]))
+        os.symlink("../../blobs/aa11", snap / "M-Q4-00001-of-00002.gguf")
+        os.symlink("../../blobs/bb22", snap / "M-Q4-00002-of-00002.gguf")
+        first = os.path.abspath(snap / "M-Q4-00001-of-00002.gguf")
+        for given in ("M-Q4-00001-of-00002.gguf", "M-Q4-00002-of-00002.gguf"):          # llama.cpp needs shard 1's own name
+            code, out, _ = self.cli(str(snap / given), "--json")
+            self.assertEqual((code, json.loads(out)[0]["status"], json.loads(out)[0]["model_path"]), (0, "ok", first), given)
+        code, _, _ = self.cli(str(snap / "M-Q4-00002-of-00002.gguf"), "--run", "--llama-server", str(self.server),
+                              "--port", str(free_port()))
+        self.assertEqual(json.loads(self.record.read_text())[:2], ["-m", first])
+
+    def test_a_corrupt_file_is_an_error_and_the_good_plan_is_still_printed(self):
+        (self.dir / "bad.gguf").write_bytes(struct.pack("<IIQQ", G.GGUF_MAGIC, 3, 0, 1) + struct.pack("<Q", 2**64 - 1))
+        code, out, _ = self.cli(str(self.dir / "bad.gguf"), str(self.dir / "m.gguf"), "--json")
+        self.assertEqual((code, [p["status"] for p in json.loads(out)]), (2, ["error", "ok"]))
+
+    def test_a_server_path_that_is_named_is_never_replaced(self):
+        path_dir = self.dir / "bin"
+        path_dir.mkdir()
+        (path_dir / "llama-server").write_bytes(self.server.read_bytes())
+        (path_dir / "llama-server").chmod(0o755)
+        notexec = self.dir / "notexec"
+        notexec.write_text("#!/bin/sh\n")
+        with env(PATH=str(path_dir), LLAMA_SERVER=None):
+            for named in ("/typo/llama-server", str(notexec)):                     # a llama-server IS on PATH: still an error
+                code, _, err = self.cli(str(self.dir / "m.gguf"), "--run", "--llama-server", named, "--port", str(free_port()))
+                self.assertEqual(code, 2, named)
+                self.assertIn("not an executable file", err)
+                self.assertFalse(self.record.exists())
+            with env(LLAMA_SERVER="/typo/from-env"):
+                code, _, err = self.cli(str(self.dir / "m.gguf"), "--run", "--port", str(free_port()))
+                self.assertEqual(code, 2)
+                self.assertIn("$LLAMA_SERVER", err)
+            code, _, _ = self.cli(str(self.dir / "m.gguf"), "--run", "--port", str(free_port()))      # nothing named: PATH
+            self.assertEqual(code, 0)
+            self.assertTrue(self.record.exists())
+
+    def test_sigterm_stops_llama_server_too(self):
+        import signal
+        import subprocess
+        import time
+        pidfile = self.dir / "server.pid"
+        sleeper = self.dir / "sleeper"
+        sleeper.write_text(f"#!{sys.executable}\nimport os, sys, time\n"
+                           f"if '--help' in sys.argv: print('--n-cpu-moe')\n"
+                           f"else:\n    open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n    time.sleep(120)\n")
+        sleeper.chmod(0o755)
+        planner = subprocess.Popen([sys.executable, str(ROOT / "tools" / "llama_plan.py"), str(self.dir / "m.gguf"), "--vram", "16",
+                                    "--ram", "32", "--run", "--llama-server", str(sleeper), "--port", str(free_port())],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(lambda: planner.poll() is None and planner.kill())
+        for _ in range(100):                                              # the server has started
+            if pidfile.exists() and pidfile.read_text():
+                break
+            time.sleep(0.1)
+        server_pid = int(pidfile.read_text())
+        planner.send_signal(signal.SIGTERM)
+        planner.wait(timeout=30)
+        for _ in range(100):
+            try:
+                os.kill(server_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(server_pid, signal.SIGKILL)
+            self.fail("llama-server outlived the planner")
 
     def test_a_slow_plan_needs_force(self):
         code, _, err = self.cli(str(self.dir / "m.gguf"), "--run", "--llama-server", str(self.server), "--ram", "6",
@@ -330,6 +465,7 @@ class Detection(unittest.TestCase):
     def test_ram(self):
         self.assertGreater(L.detect_ram_gib() or 0, 0.5)
 
+    @unittest.skipIf(sys.platform == "win32", "the fake nvidia-smi is a POSIX script")
     def test_vram_from_nvidia_smi(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             exe = Path(d) / "nvidia-smi"
@@ -343,6 +479,19 @@ class Detection(unittest.TestCase):
                 self.assertIsNone(L.detect_vram_gib())
             finally:
                 L.shutil.which = old
+
+
+@contextlib.contextmanager
+def env(**kw):
+    """Environment variables set (None = removed) for a block."""
+    old = {k: os.environ.get(k) for k in kw}
+    for k, v in kw.items():
+        os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
 
 def free_port() -> int:

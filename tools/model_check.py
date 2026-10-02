@@ -67,6 +67,8 @@ def is_hub(netloc: str) -> bool:
     """huggingface.co, hf.co or one of their subdomains - not a host that merely ends the same way."""
     host = netloc.rsplit("@", 1)[-1].split(":")[0].lower()
     return any(host == h or host.endswith("." + h) for h in HF_HOSTS)
+
+
 CHUNK = 8 << 20                                               # one Range request: most headers fit in one or two
 MAX_HEADER = 256 << 20                                        # a header larger than this is not a GGUF header
 UA = "strata-model-check"
@@ -192,7 +194,7 @@ def analyse(target: str, files: list, declared: int) -> Report:
         rep.problems.append(
             f"architecture is '{arch}', Strata runs '{ARCH}' only (the engine refuses anything else, and its kernels are "
             f"written for that one layout). Supporting '{arch}' would be a new model implementation - loader and "
-            "kernels - not a configuration; a general-purpose runtime (llama.cpp and the like) is the tool for this file")
+            "kernels - not a configuration; tools/llama_plan.py plans llama.cpp's expert offload for this file on your PC")
         return rep
 
     # 1. the metadata the engine checks itself
@@ -353,8 +355,9 @@ def classify(arg: str, default_rev: str, endpoint: str):
     raise ValueError(f"{arg}: not a file, a URL or an owner/repo")
 
 
-def read_model(label: str, first: str, src: Source) -> Report:
-    """Reads every shard of the model whose first shard is `first` (a path or a URL) and judges it."""
+def read_headers(first: str, src: Source):
+    """(files, names, absent): the headers of every shard of the model whose first shard is `first` (a path or a URL),
+    the shard names its file name declares, and those of them that could not be found."""
     is_url = first.startswith(("http://", "https://"))
     base, _, name = first.rpartition("/") if is_url else (str(pathlib.Path(first).parent), "", pathlib.Path(first).name)
     names = shard_names(urllib.parse.unquote(name) if is_url else name)
@@ -372,42 +375,51 @@ def read_model(label: str, first: str, src: Source) -> Report:
             raise
     if not files:
         raise FileNotFoundError(f"{names[0]}: not found")
+    return files, names, absent
+
+
+def read_model(label: str, first: str, src: Source) -> Report:
+    """Reads every shard of the model whose first shard is `first` and judges it."""
+    files, names, absent = read_headers(first, src)
     rep = analyse(label, files, len(names))
     if absent and len(files) != len(names):
         rep.warnings.append("shards not found: " + ", ".join(absent))
     return rep
 
 
+def resolve(arg: str, a, src: Source) -> list:
+    """[(label, first-shard path or URL)] for one command-line target; a repo expands to its model files."""
+    kind, what = classify(arg, a.rev, src.endpoint)
+    if kind != "repo":
+        return [(arg, what)]
+    repo, rev = what
+    urls = src.repo_files(repo, rev)
+    picked = [u for u in urls if a.match.lower() in urllib.parse.unquote(u).lower()]
+    log.info("%s: %d model file(s), %d match", repo, len(urls), len(picked))
+    if not picked:
+        raise FileNotFoundError(f"{repo}: no model .gguf file" + (f" matching '{a.match}'" if a.match else ""))
+    if len(picked) > a.max_files:
+        log.warning("%s: %d more file(s) not read (--max-files %d); narrow with --match",
+                    repo, len(picked) - a.max_files, a.max_files)
+    return [(f"{repo} :: {urllib.parse.unquote(u).rsplit('/', 1)[-1]}", u) for u in picked[:a.max_files]]
+
+
 def run_target(arg: str, a, src: Source) -> list:
     reports = []
     try:
-        kind, what = classify(arg, a.rev, src.endpoint)
-        if kind == "repo":
-            repo, rev = what
-            urls = src.repo_files(repo, rev)
-            picked = [u for u in urls if a.match.lower() in urllib.parse.unquote(u).lower()]
-            log.info("%s: %d model file(s), %d match", repo, len(urls), len(picked))
-            if not picked:
-                raise FileNotFoundError(f"{repo}: no model .gguf file" + (f" matching '{a.match}'" if a.match else ""))
-            skipped = len(picked) - a.max_files
-            targets = [(f"{repo} :: {urllib.parse.unquote(u).rsplit('/', 1)[-1]}", u) for u in picked[:a.max_files]]
-            if skipped > 0:
-                log.warning("%s: %d more file(s) not read (--max-files %d); narrow with --match", repo, skipped, a.max_files)
-        else:
-            targets = [(arg, what)]
-        for label, first in targets:
+        for label, first in resolve(arg, a, src):
             try:
                 reports.append(read_model(label, first, src))
             except (OSError, struct.error, KeyError, ValueError, UnicodeError, MemoryError) as e:
                 log.debug("%s", label, exc_info=True)
-                reports.append(Report(target=label, status="error", problems=[_why(e)]))
+                reports.append(Report(target=label, status="error", problems=[why(e)]))
     except (OSError, ValueError, json.JSONDecodeError) as e:
         log.debug("%s", arg, exc_info=True)
-        reports.append(Report(target=arg, status="error", problems=[_why(e)]))
+        reports.append(Report(target=arg, status="error", problems=[why(e)]))
     return reports
 
 
-def _why(e: Exception) -> str:
+def why(e: Exception) -> str:
     if isinstance(e, urllib.error.HTTPError):
         hint = {401: " (private or gated: set HF_TOKEN)", 403: " (refused: a gated repo, or a network policy blocks the host)",
                 404: " (not found)"}.get(e.code, "")
@@ -444,10 +456,8 @@ def show(r: Report) -> None:
             print(f"  {label if i == 0 else '':<12} {line}")
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Can Strata run this model file? Reads the GGUF header only.",
-                                 epilog="A target is a .gguf file (the first shard), a URL of one, or a Hugging Face "
-                                        "owner/repo (or its page URL).")
+def add_source_options(ap: argparse.ArgumentParser) -> None:
+    """The targets and where their headers come from - shared with tools/llama_plan.py."""
     ap.add_argument("targets", nargs="+", help="file, URL or owner/repo")
     ap.add_argument("--rev", default="main", help="branch, tag or commit of a Hugging Face repo (default main)")
     ap.add_argument("--match", default="", help="of a repo's files, read those whose name contains this (e.g. IQ3_XXS)")
@@ -457,15 +467,26 @@ def main(argv=None) -> int:
     ap.add_argument("--token", default=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"),
                     help="Hub token for gated repos (default $HF_TOKEN)")
     ap.add_argument("--timeout", type=float, default=60.0, help="seconds per request (default 60)")
-    ap.add_argument("--json", action="store_true", help="print the reports as JSON")
     ap.add_argument("-v", "--verbose", action="count", default=0, help="-v: what is read; -vv: every request")
-    a = ap.parse_args(argv)
+
+
+def source_from(a, ap: argparse.ArgumentParser) -> Source:
+    """Logging and the Source from the options add_source_options defined (a usage error when they are out of range)."""
     logging.basicConfig(level=[logging.WARNING, logging.INFO, logging.DEBUG][min(a.verbose, 2)],
                         format="%(levelname)s %(name)s: %(message)s", stream=sys.stderr)
     if a.max_files < 1 or a.timeout <= 0:
         ap.error("--max-files and --timeout must be positive")
+    return Source(a.token, a.endpoint, a.timeout)
 
-    src = Source(a.token, a.endpoint, a.timeout)
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Can Strata run this model file? Reads the GGUF header only.",
+                                 epilog="A target is a .gguf file (the first shard), a URL of one, or a Hugging Face "
+                                        "owner/repo (or its page URL).")
+    add_source_options(ap)
+    ap.add_argument("--json", action="store_true", help="print the reports as JSON")
+    a = ap.parse_args(argv)
+    src = source_from(a, ap)
     reports = [r for t in a.targets for r in run_target(t, a, src)]
     if a.json:
         print(json.dumps([dataclasses.asdict(r) for r in reports], indent=2))

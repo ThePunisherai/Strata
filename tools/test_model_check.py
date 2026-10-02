@@ -31,10 +31,15 @@ def _s(x: str) -> bytes:
 
 
 def gguf(kv: dict, tensors: list) -> bytes:
-    """A GGUF v3 header: kv = {key: str | int (u32)}, tensors = [(name, shape, type name)]; no tensor data."""
+    """A GGUF v3 header: kv = {key: str | int (u32) | [int] (i32 array)}, tensors = [(name, shape, type name)]; no tensor data."""
     b = bytearray(struct.pack("<IIQQ", G.GGUF_MAGIC, 3, len(tensors), len(kv)))
     for k, v in kv.items():
-        b += _s(k) + (struct.pack("<I", 8) + _s(v) if isinstance(v, str) else struct.pack("<II", 4, v))
+        if isinstance(v, str):
+            b += _s(k) + struct.pack("<I", 8) + _s(v)
+        elif isinstance(v, list):                                   # an array of i32
+            b += _s(k) + struct.pack("<IIQ", 9, 5, len(v)) + struct.pack(f"<{len(v)}i", *v)
+        else:
+            b += _s(k) + struct.pack("<II", 4, v)
     for name, shape, ty in tensors:
         b += _s(name) + struct.pack("<I", len(shape)) + struct.pack(f"<{len(shape)}Q", *shape) + \
             struct.pack("<IQ", TYPE_ID[ty], 0)
